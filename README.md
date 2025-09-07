@@ -146,3 +146,18 @@ Check out how to contribute to the CLI in [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 This project is under an [MIT license](LICENSE.txt).
+
+## Standalone Executable (Experimental SEA Build)
+
+An experimental single-file executable build of the CLI using Node.js SEA (Single Executable Applications) can be produced locally. This binary embeds the JS bundle and the native `node-pty` addon (extracted at runtime to a temporary directory).
+
+Build locally (Node 20+ required):
+
+```bash
+yarn
+yarn build:sea
+./dist/sea/devcontainer.$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m) --help
+```
+
+See `docs/features/sea-binary.md` for more details, limitations, and roadmap.
+
