@@ -90,6 +90,8 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 		y.command('generate-docs', 'Generate documentation', templatesGenerateDocsOptions, templatesGenerateDocsHandler);
 	});
 	y.command(restArgs ? ['exec', '*'] : ['exec <cmd> [args..]'], 'Execute a command on a running dev container', execOptions, execHandler);
+	// New 'enter' command: open an interactive shell inside the dev container.
+	y.command('enter', 'Enter an interactive shell in the dev container', enterOptions, enterHandler);
 	y.epilog(`devcontainer@${version} ${packageFolder}`);
 	y.parse(restArgs ? argv.slice(1) : argv);
 
@@ -1250,6 +1252,211 @@ function execOptions(y: Argv) {
 }
 
 export type ExecArgs = UnpackArgv<ReturnType<typeof execOptions>>;
+
+// ----------------------------- ENTER COMMAND ----------------------------------
+function enterOptions(y: Argv) {
+	return y.options({
+		'user-data-folder': { type: 'string', description: 'Host path to a directory that is intended to be persisted and share state between sessions.' },
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'docker-compose-path': { type: 'string', description: 'Docker Compose CLI path.' },
+		'container-data-folder': { type: 'string', description: 'Container data folder where user data inside the container will be stored.' },
+		'container-system-data-folder': { type: 'string', description: 'Container system data folder where system data inside the container will be stored.' },
+		'workspace-folder': { type: 'string', description: 'Workspace folder path. The devcontainer.json will be looked up relative to this path.' },
+		'mount-workspace-git-root': { type: 'boolean', default: true, description: 'Mount the workspace using its Git root.' },
+		'container-id': { type: 'string', description: 'Id of the container to run the user commands for.' },
+		'id-label': { type: 'string', description: 'Id label(s) of the format name=value. If no --container-id is given the id labels will be used to look up the container. If no --id-label is given, one will be inferred from the --workspace-folder path.' },
+		'config': { type: 'string', description: 'devcontainer.json path. The default is to use .devcontainer/devcontainer.json or, if that does not exist, .devcontainer.json in the workspace folder.' },
+		'override-config': { type: 'string', description: 'devcontainer.json path to override any devcontainer.json in the workspace folder (or built-in configuration). This is required when there is no devcontainer.json otherwise.' },
+		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level for the --terminal-log-file. When set to trace, the log level for --log-file will also be set to trace.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'terminal-columns': { type: 'number', implies: ['terminal-rows'], description: 'Number of columns to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'terminal-rows': { type: 'number', implies: ['terminal-columns'], description: 'Number of rows to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'default-user-env-probe': { choices: ['none' as 'none', 'loginInteractiveShell' as 'loginInteractiveShell', 'interactiveShell' as 'interactiveShell', 'loginShell' as 'loginShell'], default: defaultDefaultUserEnvProbe, description: 'Default value for the devcontainer.json\'s "userEnvProbe".' },
+		'remote-env': { type: 'string', description: 'Remote environment variables of the format name=value. These will be added when executing the user commands.' },
+		'skip-feature-auto-mapping': { type: 'boolean', default: false, hidden: true, description: 'Temporary option for testing.' },
+		'shell': { type: 'string', description: 'Override detected default shell inside container.' },
+	})
+		.check(argv => {
+			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
+			if (idLabels?.some(idLabel => !/.+=.+/.test(idLabel))) {
+				throw new Error('Unmatched argument format: id-label must match <name>=<value>');
+			}
+			const remoteEnvs = (argv['remote-env'] && (Array.isArray(argv['remote-env']) ? argv['remote-env'] : [argv['remote-env']])) as string[] | undefined;
+			if (remoteEnvs?.some(remoteEnv => !/.+=.*/.test(remoteEnv))) {
+				throw new Error('Unmatched argument format: remote-env must match <name>=<value>');
+			}
+			if (!argv['container-id'] && !idLabels?.length && !argv['workspace-folder']) {
+				throw new Error('Missing required argument: One of --container-id, --id-label or --workspace-folder is required.');
+			}
+			return true;
+		});
+}
+
+export type EnterArgs = UnpackArgv<ReturnType<typeof enterOptions>>;
+
+function enterHandler(args: EnterArgs) {
+	runAsyncHandler(enter.bind(null, args));
+}
+
+async function enter(_args: EnterArgs) {
+	const result = await doEnter(_args as EnterArgs & { _?: string[] });
+	const exitCode = typeof result.code === 'number' && (result.code || !result.signal) ? result.code :
+		typeof result.signal === 'number' && result.signal > 0 ? 128 + result.signal :
+			typeof result.signal === 'string' && processSignals[result.signal] ? 128 + processSignals[result.signal]! : 1;
+	await result.dispose();
+	process.exit(exitCode);
+}
+
+export async function doEnter({
+	'user-data-folder': persistedFolder,
+	'docker-path': dockerPath,
+	'docker-compose-path': dockerComposePath,
+	'container-data-folder': containerDataFolder,
+	'container-system-data-folder': containerSystemDataFolder,
+	'workspace-folder': workspaceFolderArg,
+	'mount-workspace-git-root': mountWorkspaceGitRoot,
+	'container-id': containerId,
+	'id-label': idLabel,
+	config: configParam,
+	'override-config': overrideConfig,
+	'log-level': logLevel,
+	'log-format': logFormat,
+	'terminal-rows': terminalRows,
+	'terminal-columns': terminalColumns,
+	'default-user-env-probe': defaultUserEnvProbe,
+	'remote-env': addRemoteEnv,
+	'skip-feature-auto-mapping': skipFeatureAutoMapping,
+	'shell': shellOverride,
+	_: restArgs,
+}: EnterArgs & { _?: string[] }) {
+	const disposables: (() => Promise<unknown> | undefined)[] = [];
+	const dispose = async () => {
+		await Promise.all(disposables.map(d => d()));
+	};
+	let output: Log | undefined;
+	const isTTY = process.stdin.isTTY && process.stdout.isTTY || logFormat === 'json';
+	try {
+		const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
+		const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+		const addRemoteEnvs = addRemoteEnv ? (Array.isArray(addRemoteEnv) ? addRemoteEnv as string[] : [addRemoteEnv]) : [];
+		const configFile = configParam ? URI.file(path.resolve(process.cwd(), configParam)) : undefined;
+		const overrideConfigFile = overrideConfig ? URI.file(path.resolve(process.cwd(), overrideConfig)) : undefined;
+		const params = await createDockerParams({
+			dockerPath,
+			dockerComposePath,
+			containerDataFolder,
+			containerSystemDataFolder,
+			workspaceFolder,
+			mountWorkspaceGitRoot,
+			configFile,
+			overrideConfigFile,
+			logLevel: mapLogLevel(logLevel),
+			logFormat,
+			log: text => process.stderr.write(text),
+			terminalDimensions: terminalColumns && terminalRows ? { columns: terminalColumns, rows: terminalRows } : isTTY ? { columns: process.stdout.columns, rows: process.stdout.rows } : undefined,
+			onDidChangeTerminalDimensions: terminalColumns && terminalRows ? undefined : isTTY ? createStdoutResizeEmitter(disposables) : undefined,
+			defaultUserEnvProbe,
+			removeExistingContainer: false,
+			buildNoCache: false,
+			expectExistingContainer: false,
+			postCreateEnabled: true,
+			skipNonBlocking: false,
+			prebuild: false,
+			persistedFolder,
+			additionalMounts: [],
+			updateRemoteUserUIDDefault: 'never',
+			remoteEnv: envListToObj(addRemoteEnvs),
+			additionalCacheFroms: [],
+			useBuildKit: 'auto',
+			omitLoggerHeader: true,
+			buildxPlatform: undefined,
+			buildxPush: false,
+			additionalLabels: [],
+			buildxCacheTo: undefined,
+			skipFeatureAutoMapping,
+			buildxOutput: undefined,
+			skipPostAttach: false,
+			skipPersistingCustomizationsFromFeatures: false,
+			dotfiles: {}
+		}, disposables);
+
+		const { common } = params;
+		const { cliHost } = common;
+		output = common.output;
+		const workspace = workspaceFolder ? workspaceFromPath(cliHost.path, workspaceFolder) : undefined;
+		const configPath = configFile ? configFile : workspace
+			? (await getDevContainerConfigPathIn(cliHost, workspace.configFolderPath)
+				|| (overrideConfigFile ? getDefaultDevContainerConfigPath(cliHost, workspace.configFolderPath) : undefined))
+			: overrideConfigFile;
+		const configs = configPath && await readDevContainerConfigFile(cliHost, workspace, configPath, params.mountWorkspaceGitRoot, output, undefined, overrideConfigFile) || undefined;
+		if ((configFile || workspaceFolder || overrideConfigFile) && !configs) {
+			throw new ContainerError({ description: `Dev container config (${uriToFsPath(configFile || getDefaultDevContainerConfigPath(cliHost, workspace!.configFolderPath), cliHost.platform)}) not found.` });
+		}
+
+		const config = configs?.config || {
+			raw: {},
+			config: {},
+			substitute: value => substitute({ platform: cliHost.platform, env: cliHost.env }, value)
+		};
+
+		const { container, idLabels } = await findContainerAndIdLabels(params, containerId, providedIdLabels, workspaceFolder, configPath?.fsPath);
+		if (!container) {
+			bailOut(common.output, 'Dev container not found.');
+		}
+		const imageMetadata = getImageMetadataFromContainer(container, config, undefined, idLabels, output).config;
+		const mergedConfig = mergeConfiguration(config.config, imageMetadata);
+		const containerProperties = await createContainerProperties(params, container.Id, configs?.workspaceConfig.workspaceFolder, mergedConfig.remoteUser);
+		const updatedConfig = containerSubstitute(cliHost.platform, config.config.configFilePath, containerProperties.env, mergedConfig);
+		const remoteEnv = probeRemoteEnv(common, containerProperties, updatedConfig);
+		const remoteCwd = containerProperties.remoteWorkspaceFolder || containerProperties.homeFolder;
+
+		// Determine final shell path
+		const desiredShell = (shellOverride || process.env.DEVCONTAINER_ENTER_SHELL || '').trim();
+		let shellPath = desiredShell;
+		if (!shellPath) {
+			// Probe inside container for default shell (follow spec precedence)
+			// Use small script to evaluate $SHELL, passwd entry, /bin/bash, /bin/sh
+			const probeScript = `if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then printf %s "$SHELL"; else u=$(id -un); s=$(getent passwd "$u" 2>/dev/null | cut -d: -f7); if [ -n "$s" ] && [ -x "$s" ]; then printf %s "$s"; elif command -v bash >/dev/null 2>&1; then printf /bin/bash; else printf /bin/sh; fi; fi`;
+			try {
+				const probeResult = await runRemoteCommand({ ...common, output: makeLog(output, LogLevel.Error) }, containerProperties, ['sh', '-c', probeScript], remoteCwd, { remoteEnv: await remoteEnv, pty: false, print: 'end' });
+				// probeResult.cmdOutput includes stdout+stderr separated by newline(s). Extract first token.
+				const firstLine = (probeResult.cmdOutput || '').split(/\r?\n/)[0].trim();
+				if (firstLine) {
+					shellPath = firstLine;
+				}
+			} catch (e) {
+				output.write(`Shell probe failed, defaulting to /bin/sh`, LogLevel.Warning);
+			}
+			if (!shellPath) {
+				shellPath = '/bin/sh';
+			}
+		}
+
+		// Gather extra args: `restArgs` from yargs includes the command name and any following tokens.
+		// When user invokes: devcontainer enter -- -c "echo hi" -> restArgs should be ['enter','-c','echo hi']
+		// We drop the first occurrence of 'enter'.
+		const shellArgsSource = restArgs || [];
+		const shellArgs = shellArgsSource.slice(shellArgsSource[0] === 'enter' ? 1 : 0);
+		// If no extra args, attempt login flag for common shells.
+		if (!shellArgs.length) {
+			if (/\/(ba|z|)sh$/.test(shellPath) || /\/dash$/.test(shellPath) || /\/ash$/.test(shellPath) || /\/ksh$/.test(shellPath)) {
+				shellArgs.push('-l');
+			}
+		}
+
+		await runRemoteCommand({ ...common, output, stdin: process.stdin, ...(logFormat !== 'json' ? { stdout: process.stdout, stderr: process.stderr } : {}) }, containerProperties, [shellPath, ...shellArgs], remoteCwd, { remoteEnv: await remoteEnv, pty: isTTY, print: 'continuous' });
+		return { code: 0, dispose };
+	} catch (err) {
+		if (!err?.code && !err?.signal) {
+			if (output) {
+				output.write(err?.stack || err?.message || String(err), LogLevel.Error);
+			} else {
+				console.error(err?.stack || err?.message || String(err));
+			}
+		}
+		return { code: err?.code as number | undefined, signal: err?.signal as string | number | undefined, dispose };
+	}
+}
 
 function execHandler(args: ExecArgs) {
 	runAsyncHandler(exec.bind(null, args));

@@ -15,6 +15,7 @@ This CLI is in active development. Current status:
 - [x] `devcontainer run-user-commands` - Runs lifecycle commands like `postCreateCommand`
 - [x] `devcontainer read-configuration` - Outputs current configuration for workspace
 - [x] `devcontainer exec` - Executes a command in a container with `userEnvProbe`, `remoteUser`, `remoteEnv`, and other properties applied
+- [x] `devcontainer enter` - Opens an interactive shell inside the dev container using the spec-detected default shell
 - [x] `devcontainer features <...>` - Tools to assist in authoring and testing [Dev Container Features](https://containers.dev/implementors/features/)
 - [x] `devcontainer templates <...>` - Tools to assist in authoring and testing [Dev Container Templates](https://containers.dev/implementors/templates/)
 - [ ] `devcontainer stop` - Stops containers
@@ -45,6 +46,7 @@ Commands:
   devcontainer features             Features commands
   devcontainer templates            Templates commands
   devcontainer exec <cmd> [args..]  Execute a command on a running dev container
+  devcontainer enter                Enter an interactive shell in the dev container
 
 Options:
   --help     Show help                                                 [boolean]
@@ -101,6 +103,33 @@ Hello, VS Code Remote - Containers!
 ```
 
 Congrats, you've just run the dev container CLI and seen it in action!
+
+### Enter an interactive shell
+
+`devcontainer enter` drops you into the default interactive login shell for the container's effective user (respecting `remoteUser` and environment probing). The shell detection order is:
+
+1. `--shell` CLI flag (if provided)
+2. `DEVCONTAINER_ENTER_SHELL` host environment variable
+3. `$SHELL` inside the container (if executable)
+4. Shell from `/etc/passwd` entry for the user (via `getent passwd`)
+5. `/bin/bash` if available
+6. `/bin/sh` fallback
+
+Examples:
+
+```bash
+# Enter container with detected shell (login mode)
+devcontainer enter --workspace-folder <path>
+
+# Run a one-off command via the shell
+devcontainer enter --workspace-folder <path> -- -c "echo hello from container"
+
+# Force a particular shell
+devcontainer enter --workspace-folder <path> --shell /bin/bash
+
+# Use DEVCONTAINER_ENTER_SHELL environment variable
+DEVCONTAINER_ENTER_SHELL=/usr/bin/fish devcontainer enter --workspace-folder <path>
+```
 
 ## More CLI examples
 
