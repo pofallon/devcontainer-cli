@@ -1,0 +1,5 @@
+{
+  "main": "./sea-bootstrap.mjs",
+  "output": "dist/sea/devcontainer.linux-arm64.blob",
+  "disableExperimentalSEAWarning": true
+}

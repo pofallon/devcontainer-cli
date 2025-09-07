@@ -41,7 +41,10 @@
 		"test-matrix": "env TS_NODE_PROJECT=src/test/tsconfig.json mocha -r ts-node/register --exit",
 		"test-container-features": "env TS_NODE_PROJECT=src/test/tsconfig.json mocha -r ts-node/register --exit src/test/container-features/*.test.ts",
 		"test-container-features-cli": "env TS_NODE_PROJECT=src/test/tsconfig.json mocha -r ts-node/register --exit src/test/container-features/featuresCLICommands.test.ts",
-		"test-container-templates": "env TS_NODE_PROJECT=src/test/tsconfig.json mocha -r ts-node/register --exit src/test/container-templates/*.test.ts"
+		"test-container-templates": "env TS_NODE_PROJECT=src/test/tsconfig.json mocha -r ts-node/register --exit src/test/container-templates/*.test.ts",
+		"build:sea": "node scripts/sea-build.js",
+		"test:sea": "node scripts/sea-test.js",
+		"package:sea": "yarn build:sea && node scripts/sea-test.js && tar -C dist/sea -czf devcontainer-sea-`uname -s`-`uname -m`.tar.gz ."
 	},
 	"files": [
 		"CHANGELOG.md",
@@ -82,6 +85,7 @@
 		"mocha": "^11.1.0",
 		"npm-run-all": "^4.1.5",
 		"p-all": "^5.0.0",
+		"postject": "^1.0.0-alpha.6",
 		"rimraf": "^5.0.10",
 		"ts-node": "^10.9.2",
 		"typescript": "^5.8.2",
